@@ -8,7 +8,6 @@ from tkinter import ttk
 import threading
 from typing import Callable, Optional
 from PIL import Image, ImageDraw, ImageTk
-import io
 
 
 def create_ear_icon(size: int = 32, color: str = "#4CAF50") -> Image.Image:
@@ -88,7 +87,7 @@ class StatusWindow:
             icon = create_ear_icon(32, "#4CAF50")
             self._icon_photo = ImageTk.PhotoImage(icon)
             self._root.iconphoto(True, self._icon_photo)
-        except Exception as e:
+        except (tk.TclError, OSError) as e:
             print(f"Could not set icon: {e}")
 
         # Position in bottom-right corner

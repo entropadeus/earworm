@@ -39,17 +39,23 @@ class KeyboardTyper:
 
     def _paste_text(self, text: str) -> None:
         """Paste text using clipboard (Ctrl+V on Windows)."""
-        import pyperclip
+        try:
+            import pyperclip
+            clipboard_copy = pyperclip.copy
+            clipboard_paste = pyperclip.paste
+        except ImportError:
+            clipboard_copy = ClipboardFallback.copy
+            clipboard_paste = ClipboardFallback.paste
 
         # Save current clipboard content
         try:
-            old_clipboard = pyperclip.paste()
-        except Exception:
+            old_clipboard = clipboard_paste()
+        except (RuntimeError, OSError):
             old_clipboard = ""
 
         try:
             # Copy our text to clipboard
-            pyperclip.copy(text)
+            clipboard_copy(text)
 
             # Small delay to ensure clipboard is ready
             time.sleep(0.05)
@@ -66,8 +72,8 @@ class KeyboardTyper:
         finally:
             # Restore original clipboard content
             try:
-                pyperclip.copy(old_clipboard)
-            except Exception:
+                clipboard_copy(old_clipboard)
+            except (RuntimeError, OSError):
                 pass
 
     def _type_characters(self, text: str) -> None:
@@ -170,17 +176,6 @@ class ClipboardFallback:
 
         finally:
             user32.CloseClipboard()
-
-
-# Monkey-patch pyperclip if not available
-try:
-    import pyperclip
-except ImportError:
-    print("pyperclip not found, using Windows-native clipboard")
-
-    class pyperclip:
-        copy = ClipboardFallback.copy
-        paste = ClipboardFallback.paste
 
 
 if __name__ == "__main__":
