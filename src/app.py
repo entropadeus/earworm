@@ -8,7 +8,7 @@ import time
 import os
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .audio_recorder import AudioRecorder, cleanup_temp_file
 from .transcriber import Transcriber, ModelSize
@@ -34,7 +34,10 @@ class Config:
             # Default to user's app data folder
             app_data = os.environ.get("APPDATA", os.path.expanduser("~"))
             config_dir = Path(app_data) / "LocalSTT"
-            config_dir.mkdir(exist_ok=True)
+            try:
+                config_dir.mkdir(exist_ok=True)
+            except OSError as e:
+                print(f"Warning: Could not create config directory: {e}")
             self.config_path = config_dir / "config.json"
         else:
             self.config_path = Path(config_path)
@@ -49,7 +52,7 @@ class Config:
                 with open(self.config_path, 'r') as f:
                     loaded = json.load(f)
                     self._config.update(loaded)
-            except Exception as e:
+            except (json.JSONDecodeError, OSError) as e:
                 print(f"Warning: Could not load config: {e}")
 
     def save(self) -> None:
@@ -57,13 +60,13 @@ class Config:
         try:
             with open(self.config_path, 'w') as f:
                 json.dump(self._config, f, indent=2)
-        except Exception as e:
+        except OSError as e:
             print(f"Warning: Could not save config: {e}")
 
-    def get(self, key: str, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         return self._config.get(key, default)
 
-    def set(self, key: str, value) -> None:
+    def set(self, key: str, value: Any) -> None:
         self._config[key] = value
         self.save()
 

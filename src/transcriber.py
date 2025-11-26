@@ -46,21 +46,19 @@ class Transcriber:
 
         print(f"Loading Whisper model '{self.model_size}'...")
 
-        # Determine compute type based on device
-        compute_type = self._compute_type
-        if compute_type == "auto":
-            # Use int8 for CPU (faster), float16 for CUDA
-            compute_type = "int8" if self._device == "cpu" else "float16"
+        # Determine device (default to CPU for reliability)
+        device = "cpu" if self._device == "auto" else self._device
 
-        # Force CPU if CUDA isn't properly available
-        device = self._device
-        if device == "auto":
-            device = "cpu"  # Default to CPU for reliability
+        # Determine compute type based on device
+        if self._compute_type == "auto":
+            compute_type = "int8" if device == "cpu" else "float16"
+        else:
+            compute_type = self._compute_type
 
         self._model = WhisperModel(
             self.model_size,
             device=device,
-            compute_type="int8" if device == "cpu" else compute_type
+            compute_type=compute_type
         )
         print("Model loaded successfully!")
 
