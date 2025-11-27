@@ -10,13 +10,15 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Dict, List
 
-from .audio_recorder import AudioRecorder, cleanup_temp_file
-from .transcriber import Transcriber, ModelSize
-from .keyboard_typer import KeyboardTyper
-from .hotkey_manager import PushToTalkManager
-from .gui import StatusWindow
-from .text_processor import TextProcessingPipeline, VoiceCommandProcessor, SmartPunctuator
-from .preview_window import PreviewManager, PreviewWindowConfig, PreviewResult, PreviewAction
+from audio_recorder import AudioRecorder, cleanup_temp_file
+from transcriber import Transcriber, ModelSize
+from keyboard_typer import KeyboardTyper
+from hotkey_manager import PushToTalkManager
+from gui import StatusWindow
+from text_processor import TextProcessingPipeline, VoiceCommandProcessor, SmartPunctuator
+from preview_window import PreviewManager, PreviewWindowConfig, PreviewResult, PreviewAction
+from streaming_transcriber import StreamingTranscriber
+from streaming_coordinator import StreamingCoordinator, StreamingState
 from pynput.keyboard import Key
 
 
@@ -59,6 +61,13 @@ class Config:
 
         # Advanced
         "custom_voice_commands": [],  # List of custom command definitions
+
+        # Streaming mode (real-time transcription)
+        "enable_streaming": True,              # Enable real-time streaming mode
+        "streaming_chunk_duration": 1.0,       # Seconds between transcription passes
+        "streaming_buffer_duration": 5.0,      # Audio context buffer size
+        "streaming_agreement_threshold": 2,    # Iterations before confirming words
+        "streaming_enable_corrections": True,  # Auto-correct revised words
     }
 
     def __init__(self, config_path: Optional[str] = None):
@@ -160,6 +169,11 @@ class STTApp:
         # For re-recording support
         self._pending_rerecord = False
 
+        # Streaming mode components (initialized after model loads)
+        self._streaming_transcriber: Optional[StreamingTranscriber] = None
+        self._streaming_coordinator: Optional[StreamingCoordinator] = None
+        self._streaming_mode = False  # True when streaming is active
+
         # Wire up callbacks
         self._setup_callbacks()
 
@@ -207,6 +221,73 @@ class STTApp:
         self.gui.set_callback("toggle_recording", self.toggle_recording)
         self.gui.set_callback("exit", self.stop)
 
+    def _init_streaming(self) -> None:
+        """Initialize streaming components after model is loaded."""
+        if not self.config.get("enable_streaming", True):
+            print("Streaming mode disabled in config")
+            return
+
+        if not self.transcriber.is_loaded():
+            print("Warning: Cannot init streaming - model not loaded")
+            return
+
+        try:
+            # Create streaming transcriber sharing the loaded model
+            self._streaming_transcriber = StreamingTranscriber(
+                model=self.transcriber._model,
+                chunk_duration=self.config.get("streaming_chunk_duration", 1.0),
+                buffer_duration=self.config.get("streaming_buffer_duration", 5.0),
+                agreement_threshold=self.config.get("streaming_agreement_threshold", 2),
+                language=self.config.get("language")
+            )
+
+            # Create streaming coordinator
+            self._streaming_coordinator = StreamingCoordinator(
+                streaming_transcriber=self._streaming_transcriber,
+                keyboard_typer=self.typer,
+                text_processor=self.text_processor,
+                on_word_typed=self._on_streaming_word,
+                on_tentative_update=self._on_streaming_tentative,
+                on_state_change=self._on_streaming_state_change,
+                on_error=self._on_streaming_error,
+                enable_corrections=self.config.get("streaming_enable_corrections", True)
+            )
+
+            print("Streaming mode initialized successfully")
+
+        except Exception as e:
+            print(f"Error initializing streaming: {e}")
+            import traceback
+            traceback.print_exc()
+            self._streaming_transcriber = None
+            self._streaming_coordinator = None
+
+    def _on_streaming_word(self, word: str) -> None:
+        """Callback when a word is typed in streaming mode."""
+        # Could update UI or log here
+        pass
+
+    def _on_streaming_tentative(self, tentative: str) -> None:
+        """Callback for tentative text updates."""
+        # Could show tentative text in UI
+        if tentative:
+            self.gui.update_title(f"Earworm - ...{tentative[-30:]}")
+
+    def _on_streaming_state_change(self, state: StreamingState) -> None:
+        """Callback for streaming state changes."""
+        if state == StreamingState.STREAMING:
+            self.gui.set_state(StatusWindow.STATE_RECORDING)
+        elif state == StreamingState.STOPPING:
+            self.gui.set_state(StatusWindow.STATE_PROCESSING)
+        elif state == StreamingState.IDLE:
+            self.gui.set_state(StatusWindow.STATE_IDLE)
+
+    def _on_streaming_error(self, error: Exception) -> None:
+        """Callback for streaming errors."""
+        print(f"Streaming error: {error}")
+        if self.config.get("show_notifications"):
+            self.gui.notify("Streaming Error", str(error))
+
     def start_recording(self) -> None:
         """Start recording audio (called on key press)."""
         with self._lock:
@@ -214,10 +295,36 @@ class STTApp:
                 return
             self._is_recording = True
 
-        self.recorder.start()
-        self.gui.set_state(StatusWindow.STATE_RECORDING)
-        self.gui.update_title("Earworm - Recording...")
-        print("Recording started... (release F9 to stop)")
+        # Check if streaming mode is available and enabled
+        use_streaming = (
+            self.config.get("enable_streaming", True) and
+            self._streaming_coordinator is not None
+        )
+
+        if use_streaming:
+            # Streaming mode: type words as they're transcribed
+            self._streaming_mode = True
+
+            # Create recorder with streaming callback
+            self.recorder = AudioRecorder(
+                on_chunk=self._streaming_coordinator.feed_audio
+            )
+            self.recorder.start()
+
+            # Start the streaming pipeline
+            self._streaming_coordinator.start_streaming()
+
+            self.gui.set_state(StatusWindow.STATE_RECORDING)
+            self.gui.update_title("Earworm - Streaming...")
+            print("Streaming started... (release F9 to stop)")
+        else:
+            # Batch mode: record all then transcribe
+            self._streaming_mode = False
+            self.recorder = AudioRecorder()
+            self.recorder.start()
+            self.gui.set_state(StatusWindow.STATE_RECORDING)
+            self.gui.update_title("Earworm - Recording...")
+            print("Recording started... (release F9 to stop)")
 
     def stop_recording(self) -> None:
         """Stop recording and process (called on key release)."""
@@ -227,12 +334,57 @@ class STTApp:
             self._is_recording = False
             self._processing = True
 
-        self.gui.set_state(StatusWindow.STATE_PROCESSING)
-        self.gui.update_title("Earworm - Processing...")
-        print("Recording stopped, processing...")
+        if self._streaming_mode:
+            # Streaming mode: finalize and clean up
+            self.gui.set_state(StatusWindow.STATE_PROCESSING)
+            self.gui.update_title("Earworm - Finalizing...")
+            print("Streaming stopped, finalizing...")
+            threading.Thread(target=self._finalize_streaming, daemon=True).start()
+        else:
+            # Batch mode: process the recorded audio
+            self.gui.set_state(StatusWindow.STATE_PROCESSING)
+            self.gui.update_title("Earworm - Processing...")
+            print("Recording stopped, processing...")
+            threading.Thread(target=self._process_audio, daemon=True).start()
 
-        # Process in background thread
-        threading.Thread(target=self._process_audio, daemon=True).start()
+    def _finalize_streaming(self) -> None:
+        """Finalize streaming transcription."""
+        audio_path = None
+        try:
+            # Stop the streaming coordinator (types any remaining words)
+            final_text = self._streaming_coordinator.stop_streaming()
+
+            # Stop the audio recorder
+            audio_path = self.recorder.stop()
+
+            # Clean up temp audio file
+            if audio_path:
+                cleanup_temp_file(audio_path)
+
+            # Get stats
+            stats = self._streaming_coordinator.stats
+            print(f"Streaming complete: {stats.words_typed} words typed, "
+                  f"{stats.words_corrected} corrections, "
+                  f"{stats.get_words_per_minute():.1f} WPM")
+
+            if self.config.get("show_notifications") and final_text:
+                preview = final_text[:50] + "..." if len(final_text) > 50 else final_text
+                self.gui.notify("Transcribed", preview)
+
+        except Exception as e:
+            print(f"Error finalizing streaming: {e}")
+            import traceback
+            traceback.print_exc()
+            if self.config.get("show_notifications"):
+                self.gui.notify("Error", str(e))
+
+            # Clean up on error
+            if audio_path:
+                cleanup_temp_file(audio_path)
+
+        finally:
+            self._streaming_mode = False
+            self._finish_processing()
 
     def toggle_recording(self) -> None:
         """Toggle recording on/off (for tray menu)."""
@@ -397,11 +549,19 @@ class STTApp:
             try:
                 self.transcriber.load_model()
                 print("Model loaded successfully!")
+
+                # Initialize streaming mode after model is loaded
+                if self.config.get("enable_streaming", True):
+                    print("Initializing streaming mode...")
+                    self._init_streaming()
+
                 self.gui.update_title("Earworm - Ready")
+
+                mode = "streaming" if self._streaming_coordinator else "batch"
                 if self.config.get("show_notifications"):
                     self.gui.notify(
                         "Ready",
-                        "Model loaded. Hold F9 to record."
+                        f"Model loaded ({mode} mode). Hold F9 to record."
                     )
             except Exception as e:
                 print(f"Error loading model: {e}")
@@ -459,9 +619,10 @@ class STTApp:
         print("Earworm is running!")
         print("Hold F9 to record, release to transcribe")
         print("\nFeatures enabled:")
+        print(f"  - Streaming mode: {self.config.get('enable_streaming', True)}")
         print(f"  - Voice commands: {self.config.get('enable_voice_commands', True)}")
         print(f"  - Smart punctuation: {self.config.get('enable_smart_punctuation', True)}")
-        print(f"  - Preview window: {self.config.get('enable_preview', True)}")
+        print(f"  - Preview window: {self.config.get('enable_preview', True)} (batch mode only)")
 
     def stop(self) -> None:
         """Stop the application."""
@@ -557,6 +718,25 @@ def main():
         help="Preview window theme"
     )
 
+    # Streaming options
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Disable real-time streaming (use batch mode)"
+    )
+    parser.add_argument(
+        "--streaming-chunk",
+        type=float,
+        default=None,
+        help="Streaming chunk duration in seconds (default: 1.0)"
+    )
+    parser.add_argument(
+        "--streaming-buffer",
+        type=float,
+        default=None,
+        help="Streaming audio buffer duration in seconds (default: 5.0)"
+    )
+
     args = parser.parse_args()
 
     # Load config
@@ -575,6 +755,12 @@ def main():
         config.set("enable_smart_punctuation", False)
     if args.no_preview:
         config.set("enable_preview", False)
+    if args.no_streaming:
+        config.set("enable_streaming", False)
+    if args.streaming_chunk is not None:
+        config.set("streaming_chunk_duration", args.streaming_chunk)
+    if args.streaming_buffer is not None:
+        config.set("streaming_buffer_duration", args.streaming_buffer)
     if args.auto_accept is not None:
         config.set("preview_auto_accept_delay", args.auto_accept)
     if args.theme:

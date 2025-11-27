@@ -92,6 +92,92 @@ class KeyboardTyper:
         """Press the Enter key."""
         self.press_key(Key.enter)
 
+    # === Streaming/Word-level methods ===
+
+    def type_word(self, word: str, add_space: bool = True) -> None:
+        """
+        Type a single word with optional trailing space.
+
+        Uses direct keyboard typing (not clipboard) for better
+        compatibility with background threads in streaming mode.
+
+        Args:
+            word: The word to type.
+            add_space: If True, add a space after the word.
+        """
+        if not word:
+            return
+        text = word + (" " if add_space else "")
+        # Use pynput's type() method - works from any thread
+        self._keyboard.type(text)
+
+    def type_words(self, words: list, add_trailing_space: bool = True) -> None:
+        """
+        Type multiple words at once.
+
+        Uses direct keyboard typing (not clipboard) for better
+        compatibility with background threads in streaming mode.
+
+        Args:
+            words: List of words to type.
+            add_trailing_space: If True, add space after last word.
+        """
+        if not words:
+            return
+        text = " ".join(words)
+        if add_trailing_space:
+            text += " "
+        # Use pynput's type() method - works from any thread
+        self._keyboard.type(text)
+
+    def delete_word(self) -> None:
+        """Delete the previous word using Ctrl+Backspace."""
+        self._keyboard.press(Key.ctrl)
+        self._keyboard.press(Key.backspace)
+        self._keyboard.release(Key.backspace)
+        self._keyboard.release(Key.ctrl)
+        time.sleep(0.02)  # Small delay for stability
+
+    def delete_words(self, count: int) -> None:
+        """
+        Delete N previous words using Ctrl+Backspace.
+
+        Used for auto-correction when Whisper revises earlier words.
+
+        Args:
+            count: Number of words to delete.
+        """
+        for _ in range(count):
+            self.delete_word()
+
+    def delete_characters(self, count: int) -> None:
+        """
+        Delete N previous characters using Backspace.
+
+        Args:
+            count: Number of characters to delete.
+        """
+        for _ in range(count):
+            self._keyboard.press(Key.backspace)
+            self._keyboard.release(Key.backspace)
+            if self.typing_delay > 0:
+                time.sleep(self.typing_delay)
+
+    def replace_words(self, old_words: list, new_words: list) -> None:
+        """
+        Replace old words with new words (for corrections).
+
+        Deletes the old words, then types the new words.
+
+        Args:
+            old_words: Words to delete (used to count deletions).
+            new_words: Words to type in their place.
+        """
+        if old_words:
+            self.delete_words(len(old_words))
+        if new_words:
+            self.type_words(new_words, add_trailing_space=True)
+
 
 class ClipboardFallback:
     """

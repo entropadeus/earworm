@@ -7,7 +7,7 @@ import numpy as np
 import sounddevice as sd
 import threading
 import queue
-from typing import Optional
+from typing import Optional, Callable
 import tempfile
 import wave
 import os
@@ -16,34 +16,50 @@ import os
 class AudioRecorder:
     """Records audio from the microphone and saves to a temporary WAV file."""
 
-    def __init__(self, sample_rate: int = 16000, channels: int = 1):
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        channels: int = 1,
+        on_chunk: Optional[Callable[[np.ndarray], None]] = None
+    ):
         """
         Args:
             sample_rate: Audio sample rate in Hz. Whisper expects 16kHz.
             channels: Number of audio channels. Mono (1) is fine for speech.
+            on_chunk: Optional callback invoked for each audio chunk during recording.
+                      Used for real-time streaming transcription.
         """
         self.sample_rate = sample_rate
         self.channels = channels
+        self._on_chunk = on_chunk
         self._recording = False
         self._audio_queue: queue.Queue = queue.Queue()
         self._audio_data: list = []
         self._stream: Optional[sd.InputStream] = None
         self._record_thread: Optional[threading.Thread] = None
+        self._data_lock = threading.Lock()
 
     def _audio_callback(self, indata: np.ndarray, frames: int,
                         time_info: dict, status: sd.CallbackFlags) -> None:
         """Callback function for the audio stream."""
-        if status:
-            print(f"Audio status: {status}")
         # Put a copy of the audio data into the queue
-        self._audio_queue.put(indata.copy())
+        chunk = indata.copy()
+        self._audio_queue.put(chunk)
+
+        # Real-time callback for streaming mode
+        if self._on_chunk:
+            try:
+                self._on_chunk(chunk)
+            except Exception:
+                pass  # Silently ignore callback errors
 
     def _record_loop(self) -> None:
         """Background thread that collects audio data from the queue."""
         while self._recording:
             try:
                 data = self._audio_queue.get(timeout=0.1)
-                self._audio_data.append(data)
+                with self._data_lock:
+                    self._audio_data.append(data)
             except queue.Empty:
                 continue
 
@@ -136,6 +152,30 @@ class AudioRecorder:
     def is_recording(self) -> bool:
         """Check if currently recording."""
         return self._recording
+
+    def get_accumulated_audio(self) -> Optional[np.ndarray]:
+        """
+        Get all recorded audio so far without stopping.
+
+        Thread-safe access to accumulated audio data during recording.
+        Useful for streaming transcription scenarios.
+
+        Returns:
+            Concatenated audio as numpy array, or None if no audio yet.
+        """
+        with self._data_lock:
+            if not self._audio_data:
+                return None
+            return np.concatenate(self._audio_data, axis=0)
+
+    def set_on_chunk(self, callback: Optional[Callable[[np.ndarray], None]]) -> None:
+        """
+        Set or update the on_chunk callback.
+
+        Args:
+            callback: Function to call with each audio chunk, or None to disable.
+        """
+        self._on_chunk = callback
 
     @staticmethod
     def list_devices() -> None:
