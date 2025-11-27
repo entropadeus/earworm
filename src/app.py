@@ -1,6 +1,6 @@
 """
 Main STT Application.
-Coordinates all components: recording, transcription, typing, and UI.
+Coordinates all components: recording, transcription, text processing, preview, and typing.
 """
 
 import threading
@@ -8,25 +8,57 @@ import time
 import os
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Dict, List
 
 from .audio_recorder import AudioRecorder, cleanup_temp_file
 from .transcriber import Transcriber, ModelSize
 from .keyboard_typer import KeyboardTyper
 from .hotkey_manager import PushToTalkManager
 from .gui import StatusWindow
+from .text_processor import TextProcessingPipeline, VoiceCommandProcessor, SmartPunctuator
+from .preview_window import PreviewManager, PreviewWindowConfig, PreviewResult, PreviewAction
 from pynput.keyboard import Key
 
 
 class Config:
-    """Application configuration."""
+    """
+    Application configuration with support for all features.
+
+    Configuration is persisted to a JSON file and supports:
+    - Core transcription settings
+    - Voice command settings
+    - Smart punctuation settings
+    - Preview window settings
+    """
 
     DEFAULT_CONFIG = {
+        # Core settings
         "model_size": "base",
         "language": None,  # None = auto-detect
         "typing_delay": 0.0,
         "use_clipboard": True,
         "show_notifications": True,
+
+        # Voice commands
+        "enable_voice_commands": True,
+
+        # Smart punctuation
+        "enable_smart_punctuation": True,
+        "auto_capitalize": True,
+        "auto_periods": True,
+        "auto_commas": True,
+        "remove_fillers": False,  # Remove "um", "uh", etc.
+
+        # Preview window
+        "enable_preview": True,
+        "preview_auto_accept_delay": 0.0,  # 0 = disabled
+        "preview_theme": "dark",
+        "preview_position": "center",
+        "preview_font_size": 12,
+        "preview_show_shortcuts": True,
+
+        # Advanced
+        "custom_voice_commands": [],  # List of custom command definitions
     }
 
     def __init__(self, config_path: Optional[str] = None):
@@ -51,7 +83,10 @@ class Config:
             try:
                 with open(self.config_path, 'r') as f:
                     loaded = json.load(f)
-                    self._config.update(loaded)
+                    # Merge with defaults to handle new config options
+                    for key, value in loaded.items():
+                        if key in self.DEFAULT_CONFIG:
+                            self._config[key] = value
             except (json.JSONDecodeError, OSError) as e:
                 print(f"Warning: Could not load config: {e}")
 
@@ -70,14 +105,34 @@ class Config:
         self._config[key] = value
         self.save()
 
+    def get_all(self) -> Dict[str, Any]:
+        """Get all configuration values."""
+        return self._config.copy()
+
+    def update(self, updates: Dict[str, Any]) -> None:
+        """Update multiple configuration values at once."""
+        for key, value in updates.items():
+            if key in self.DEFAULT_CONFIG:
+                self._config[key] = value
+        self.save()
+
 
 class STTApp:
-    """Main Speech-to-Text Application."""
+    """
+    Main Speech-to-Text Application.
+
+    Features:
+    - Push-to-talk recording with F9
+    - Local transcription with Whisper
+    - Voice command processing
+    - Smart punctuation
+    - Preview window for review before pasting
+    """
 
     def __init__(self, config: Optional[Config] = None):
         self.config = config or Config()
 
-        # Initialize components
+        # Initialize core components
         self.recorder = AudioRecorder()
         self.transcriber = Transcriber(
             model_size=self.config.get("model_size", "base")
@@ -85,9 +140,16 @@ class STTApp:
         self.typer = KeyboardTyper(
             typing_delay=self.config.get("typing_delay", 0.0)
         )
+
         # Push-to-talk with F9 key
         self.hotkey_manager = PushToTalkManager(trigger_key=Key.f9)
         self.gui = StatusWindow()
+
+        # Text processing pipeline
+        self.text_processor = self._create_text_processor()
+
+        # Preview manager (will be configured after GUI starts)
+        self.preview_manager = self._create_preview_manager()
 
         # State
         self._is_recording = False
@@ -95,12 +157,47 @@ class STTApp:
         self._lock = threading.Lock()
         self._running = False
 
+        # For re-recording support
+        self._pending_rerecord = False
+
         # Wire up callbacks
         self._setup_callbacks()
 
+    def _create_text_processor(self) -> TextProcessingPipeline:
+        """Create and configure the text processing pipeline."""
+        pipeline = TextProcessingPipeline(
+            enable_voice_commands=self.config.get("enable_voice_commands", True),
+            enable_smart_punctuation=self.config.get("enable_smart_punctuation", True)
+        )
+
+        # Configure punctuator
+        pipeline.configure(
+            auto_capitalize=self.config.get("auto_capitalize", True),
+            auto_periods=self.config.get("auto_periods", True),
+            auto_commas=self.config.get("auto_commas", True),
+            remove_fillers=self.config.get("remove_fillers", False)
+        )
+
+        return pipeline
+
+    def _create_preview_manager(self) -> PreviewManager:
+        """Create and configure the preview manager."""
+        preview_config = PreviewWindowConfig(
+            auto_accept_delay=self.config.get("preview_auto_accept_delay", 0.0),
+            show_shortcuts=self.config.get("preview_show_shortcuts", True),
+            font_size=self.config.get("preview_font_size", 12),
+            position=self.config.get("preview_position", "center"),
+            theme=self.config.get("preview_theme", "dark")
+        )
+
+        manager = PreviewManager(config=preview_config)
+        manager.enabled = self.config.get("enable_preview", True)
+
+        return manager
+
     def _setup_callbacks(self) -> None:
         """Connect all the callback handlers."""
-        # Push-to-talk callbacks (hold Right Alt to record)
+        # Push-to-talk callbacks (hold F9 to record)
         self.hotkey_manager.set_callbacks(
             on_start=self.start_recording,
             on_stop=self.stop_recording
@@ -150,7 +247,7 @@ class STTApp:
             self.start_recording()
 
     def _process_audio(self) -> None:
-        """Process recorded audio: transcribe and type."""
+        """Process recorded audio: transcribe, process text, preview, and type."""
         audio_path = None
         try:
             # Get the recorded audio file
@@ -158,51 +255,122 @@ class STTApp:
 
             if not audio_path:
                 print("No audio recorded!")
+                self._finish_processing()
                 return
 
             # Transcribe
             print(f"Transcribing audio file: {audio_path}")
-            text = self.transcriber.transcribe(
+            raw_text = self.transcriber.transcribe(
                 audio_path,
                 language=self.config.get("language")
             )
 
-            if text:
-                print(f"Transcription: {text}")
-
-                # Small delay to ensure focus is back on the original window
-                time.sleep(0.1)
-
-                # Type the text
-                self.typer.type_text(
-                    text,
-                    use_clipboard=self.config.get("use_clipboard", True)
-                )
-
-                if self.config.get("show_notifications"):
-                    # Truncate long text for notification
-                    preview = text[:50] + "..." if len(text) > 50 else text
-                    self.gui.notify("Transcribed", preview)
-            else:
+            if not raw_text:
                 print("No speech detected in audio")
                 if self.config.get("show_notifications"):
                     self.gui.notify("No Speech", "No speech was detected")
+                self._finish_processing(audio_path)
+                return
+
+            print(f"Raw transcription: {raw_text}")
+
+            # Process through text pipeline (voice commands + smart punctuation)
+            processed_text, commands = self.text_processor.process(raw_text)
+            print(f"Processed text: {processed_text}")
+
+            if commands:
+                print(f"Voice commands executed: {[c.action.name for c in commands]}")
+
+            # Clean up audio file before preview (we don't need it anymore)
+            if audio_path:
+                cleanup_temp_file(audio_path)
+                audio_path = None
+
+            # Show preview or type directly
+            if self.config.get("enable_preview", True):
+                self._show_preview(processed_text)
+            else:
+                self._type_text(processed_text)
 
         except Exception as e:
             print(f"Error processing audio: {e}")
+            import traceback
+            traceback.print_exc()
             if self.config.get("show_notifications"):
                 self.gui.notify("Error", str(e))
+            self._finish_processing(audio_path)
 
-        finally:
-            # Clean up temp file
-            if audio_path:
-                cleanup_temp_file(audio_path)
+    def _show_preview(self, text: str) -> None:
+        """Show the preview window for text review."""
+        # Set the parent window for positioning
+        if self.gui._root:
+            self.preview_manager.set_parent(self.gui._root)
 
-            # Reset state
-            with self._lock:
-                self._processing = False
-            self.gui.set_state(StatusWindow.STATE_IDLE)
-            self.gui.update_title("Earworm - Ready")
+        def on_preview_complete(result: PreviewResult):
+            """Handle preview window result."""
+            if result.action == PreviewAction.ACCEPT:
+                self._type_text(result.text)
+            elif result.action == PreviewAction.COPY_ONLY:
+                print(f"Text copied to clipboard: {result.text[:50]}...")
+                if self.config.get("show_notifications"):
+                    self.gui.notify("Copied", "Text copied to clipboard")
+                self._finish_processing()
+            elif result.action == PreviewAction.RERECORD:
+                print("Re-recording requested")
+                self._finish_processing()
+                # Start recording again immediately
+                self.gui._root.after(100, self.start_recording)
+            elif result.action == PreviewAction.CANCEL:
+                print("Preview cancelled")
+                self._finish_processing()
+
+        def on_rerecord():
+            """Callback for re-record button."""
+            # This is called from the preview window
+            pass  # The actual re-recording is triggered in on_preview_complete
+
+        self.preview_manager.show_preview(
+            text=text,
+            on_complete=on_preview_complete,
+            on_rerecord=on_rerecord
+        )
+
+    def _type_text(self, text: str) -> None:
+        """Type the processed text into the active window."""
+        if not text:
+            self._finish_processing()
+            return
+
+        # Small delay to ensure focus is back on the original window
+        time.sleep(0.1)
+
+        # Type the text
+        self.typer.type_text(
+            text,
+            use_clipboard=self.config.get("use_clipboard", True)
+        )
+
+        print(f"Typed: {text}")
+
+        if self.config.get("show_notifications"):
+            # Truncate long text for notification
+            preview = text[:50] + "..." if len(text) > 50 else text
+            self.gui.notify("Transcribed", preview)
+
+        self._finish_processing()
+
+    def _finish_processing(self, audio_path: Optional[str] = None) -> None:
+        """Finish processing and reset state."""
+        # Clean up temp file if still exists
+        if audio_path:
+            cleanup_temp_file(audio_path)
+
+        # Reset state
+        with self._lock:
+            self._processing = False
+
+        self.gui.set_state(StatusWindow.STATE_IDLE)
+        self.gui.update_title("Earworm - Ready")
 
     def cancel_recording(self) -> None:
         """Cancel the current recording without processing."""
@@ -241,6 +409,38 @@ class STTApp:
 
         threading.Thread(target=load, daemon=True).start()
 
+    def update_config(self, updates: Dict[str, Any]) -> None:
+        """
+        Update configuration and reconfigure components.
+
+        Args:
+            updates: Dictionary of config key-value pairs to update
+        """
+        self.config.update(updates)
+
+        # Reconfigure text processor
+        self.text_processor.configure(
+            enable_voice_commands=self.config.get("enable_voice_commands", True),
+            enable_smart_punctuation=self.config.get("enable_smart_punctuation", True),
+            auto_capitalize=self.config.get("auto_capitalize", True),
+            auto_periods=self.config.get("auto_periods", True),
+            auto_commas=self.config.get("auto_commas", True),
+            remove_fillers=self.config.get("remove_fillers", False)
+        )
+
+        # Reconfigure preview manager
+        self.preview_manager.enabled = self.config.get("enable_preview", True)
+        self.preview_manager.configure(
+            auto_accept_delay=self.config.get("preview_auto_accept_delay", 0.0),
+            show_shortcuts=self.config.get("preview_show_shortcuts", True),
+            font_size=self.config.get("preview_font_size", 12),
+            position=self.config.get("preview_position", "center"),
+            theme=self.config.get("preview_theme", "dark")
+        )
+
+        # Update typer
+        self.typer.typing_delay = self.config.get("typing_delay", 0.0)
+
     def start(self) -> None:
         """Start the application."""
         if self._running:
@@ -258,6 +458,10 @@ class STTApp:
 
         print("Earworm is running!")
         print("Hold F9 to record, release to transcribe")
+        print("\nFeatures enabled:")
+        print(f"  - Voice commands: {self.config.get('enable_voice_commands', True)}")
+        print(f"  - Smart punctuation: {self.config.get('enable_smart_punctuation', True)}")
+        print(f"  - Preview window: {self.config.get('enable_preview', True)}")
 
     def stop(self) -> None:
         """Stop the application."""
@@ -266,6 +470,9 @@ class STTApp:
 
         print("Stopping Earworm...")
         self._running = False
+
+        # Close any open preview window
+        self.preview_manager.close_current()
 
         # Stop components
         self.hotkey_manager.stop()
@@ -294,7 +501,11 @@ def main():
     """Entry point for the application."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Local Speech-to-Text")
+    parser = argparse.ArgumentParser(
+        description="Earworm - Local Speech-to-Text with Voice Commands"
+    )
+
+    # Core options
     parser.add_argument(
         "--model",
         type=str,
@@ -314,6 +525,38 @@ def main():
         help="Disable desktop notifications"
     )
 
+    # Feature toggles
+    parser.add_argument(
+        "--no-voice-commands",
+        action="store_true",
+        help="Disable voice command processing"
+    )
+    parser.add_argument(
+        "--no-punctuation",
+        action="store_true",
+        help="Disable smart punctuation"
+    )
+    parser.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="Disable preview window (type directly)"
+    )
+
+    # Preview options
+    parser.add_argument(
+        "--auto-accept",
+        type=float,
+        default=None,
+        help="Auto-accept preview after N seconds (0 = disabled)"
+    )
+    parser.add_argument(
+        "--theme",
+        type=str,
+        choices=["dark", "light"],
+        default=None,
+        help="Preview window theme"
+    )
+
     args = parser.parse_args()
 
     # Load config
@@ -326,6 +569,16 @@ def main():
         config.set("language", args.language)
     if args.no_notifications:
         config.set("show_notifications", False)
+    if args.no_voice_commands:
+        config.set("enable_voice_commands", False)
+    if args.no_punctuation:
+        config.set("enable_smart_punctuation", False)
+    if args.no_preview:
+        config.set("enable_preview", False)
+    if args.auto_accept is not None:
+        config.set("preview_auto_accept_delay", args.auto_accept)
+    if args.theme:
+        config.set("preview_theme", args.theme)
 
     # Create and run app
     app = STTApp(config)
