@@ -30,13 +30,30 @@ class AudioRecorder:
         self._stream: Optional[sd.InputStream] = None
         self._record_thread: Optional[threading.Thread] = None
 
+        # Audio level monitoring
+        self._current_level: float = 0.0
+        self._level_callback: Optional[callable] = None
+
     def _audio_callback(self, indata: np.ndarray, frames: int,
                         time_info: dict, status: sd.CallbackFlags) -> None:
         """Callback function for the audio stream."""
         if status:
             print(f"Audio status: {status}")
+
         # Put a copy of the audio data into the queue
         self._audio_queue.put(indata.copy())
+
+        # Calculate audio level (RMS)
+        rms = np.sqrt(np.mean(indata ** 2))
+        # Normalize to 0-1 range (typical speech is 0.01-0.3 RMS)
+        self._current_level = min(1.0, rms * 5)
+
+        # Call level callback if set
+        if self._level_callback:
+            try:
+                self._level_callback(self._current_level)
+            except Exception:
+                pass  # Don't crash on callback errors
 
     def _record_loop(self) -> None:
         """Background thread that collects audio data from the queue."""
@@ -136,6 +153,19 @@ class AudioRecorder:
     def is_recording(self) -> bool:
         """Check if currently recording."""
         return self._recording
+
+    def get_audio_level(self) -> float:
+        """Get the current audio input level (0.0 to 1.0)."""
+        return self._current_level
+
+    def set_level_callback(self, callback: callable) -> None:
+        """
+        Set a callback to receive real-time audio level updates.
+
+        Args:
+            callback: Function that takes a float (0.0-1.0) as argument
+        """
+        self._level_callback = callback
 
     @staticmethod
     def list_devices() -> None:

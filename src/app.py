@@ -137,6 +137,9 @@ class STTApp:
         self.transcriber = Transcriber(
             model_size=self.config.get("model_size", "base")
         )
+
+        # Connect audio level monitoring to GUI
+        self.recorder.set_level_callback(self._on_audio_level)
         self.typer = KeyboardTyper(
             typing_delay=self.config.get("typing_delay", 0.0)
         )
@@ -206,6 +209,12 @@ class STTApp:
         # Tray callbacks
         self.gui.set_callback("toggle_recording", self.toggle_recording)
         self.gui.set_callback("exit", self.stop)
+
+    def _on_audio_level(self, level: float) -> None:
+        """Handle real-time audio level updates from recorder."""
+        # Forward to GUI for visualization
+        if self._is_recording and hasattr(self.gui, 'set_audio_level'):
+            self.gui.set_audio_level(level)
 
     def start_recording(self) -> None:
         """Start recording audio (called on key press)."""
